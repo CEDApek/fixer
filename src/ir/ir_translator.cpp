@@ -436,15 +436,19 @@ IR::Code IRTranslator::translateValueName(AST::NodePtr node,
   IR::Code ir;
 
   if (auto c = std::dynamic_pointer_cast<AST::IntConst>(node)) {
-    std::cerr << "[VALUE KIND] int const " << c->value << "\n";
+    if (ir_debug_enabled()) {
+      std::cerr << "[VALUE KIND] int const " << c->value << "\n";
+    }
     out = new_temp();
     ir.push_back(IR::LoadImm::create(out, c->value));
     dump_ir_code("translateValueName", ir);return ir;
   }
 
   if (auto lv = std::dynamic_pointer_cast<AST::LVal>(node)) {
-    std::cerr << "[VALUE KIND] lval " << lv->ident
-              << ", indices=" << lv->indices.size() << "\n";
+    if (ir_debug_enabled()) {
+      std::cerr << "[VALUE KIND] lval " << lv->ident
+                << ", indices=" << lv->indices.size() << "\n";
+    }
     std::string name = resolveAlias(ir_name(lv->symbol, lv->ident));
     bool is_global = global_symbols.count(name) > 0;
     bool is_array = is_array_symbol(lv->symbol);
@@ -471,8 +475,10 @@ IR::Code IRTranslator::translateValueName(AST::NodePtr node,
 
   // IMPORTANT: judgment/logical expression used as value
   if (auto bin = std::dynamic_pointer_cast<AST::BinaryExp>(node)) {
+    if (ir_debug_enabled()) {
       std::cerr << "[VALUE KIND] binary expression op="
-            << op_to_string(bin->op) << "\n";
+                << op_to_string(bin->op) << "\n";
+    }
     if (bin->op == BinaryOp::LAnd || bin->op == BinaryOp::LOr ||
         is_relop(bin->op)) {
       out = new_temp();
@@ -700,8 +706,10 @@ IR::Code IRTranslator::translateGlobalVarDef(AST::VarDefPtr node) {
 IR::Code IRTranslator::translateLValAddr(AST::LValPtr node,
                                          const std::string& addr_place) {
   IRDebugScope dbg("translateLValAddr", node->to_string());
-  std::cerr << "[ADDR] " << node->ident
-            << ", indices=" << node->indices.size() << "\n";
+  if (ir_debug_enabled()) {
+    std::cerr << "[ADDR] " << node->ident
+              << ", indices=" << node->indices.size() << "\n";
+  }
   IR::Code ir;
 
   std::string base_name = resolveAlias(ir_name(node->symbol, node->ident));
@@ -880,7 +888,9 @@ IR::Code IRTranslator::translateVarDef(AST::VarDefPtr node) {
 
 IR::Code IRTranslator::translateAssignStmt(AST::AssignStmtPtr node) {
   IRDebugScope dbg("translateAssignStmt", node->to_string());
-  std::cerr << "[ASSIGN LHS] " << node->lval->to_string() << "\n";
+  if (ir_debug_enabled()) {
+    std::cerr << "[ASSIGN LHS] " << node->lval->to_string() << "\n";
+  }
   IR::Code ir;
 
   std::string lhs_name = ir_name(node->lval->symbol, node->lval->ident);
@@ -946,8 +956,10 @@ IR::Code IRTranslator::translateReturnStmt(AST::ReturnStmtPtr node) {
 IR::Code IRTranslator::translateLVal(AST::LValPtr node,
                                      const std::string& place) {
   IRDebugScope dbg("translateLVal", node->to_string());
-  std::cerr << "[LVAL] " << node->ident
-            << ", indices=" << node->indices.size() << "\n";
+  if (ir_debug_enabled()) {
+    std::cerr << "[LVAL] " << node->ident
+              << ", indices=" << node->indices.size() << "\n";
+  }
   IR::Code ir;
 
   std::string name = ir_name(node->symbol, node->ident);
@@ -1009,7 +1021,9 @@ IR::Code IRTranslator::translateLVal(AST::LValPtr node,
 IR::Code IRTranslator::translateBinaryExp(AST::BinaryExpPtr node,
                                           const std::string& place) {
   IRDebugScope dbg("translateBinaryExp", node->to_string());
-  std::cerr << "[BINARY OP] " << op_to_string(node->op) << "\n";
+  if (ir_debug_enabled()) {
+    std::cerr << "[BINARY OP] " << op_to_string(node->op) << "\n";
+  }
   IR::Code ir;
 
   // Boolean / relational expression used as value:
@@ -1112,8 +1126,10 @@ IR::Code IRTranslator::translateUnaryExp(AST::UnaryExpPtr node,
 IR::Code IRTranslator::translateFuncCall(AST::FuncCallPtr node,
                                          const std::string& place) {
   IRDebugScope dbg("translateFuncCall", node->to_string());
-  std::cerr << "[CALL] " << node->name
-            << ", args=" << node->args.size() << "\n";
+  if (ir_debug_enabled()) {
+    std::cerr << "[CALL] " << node->name
+              << ", args=" << node->args.size() << "\n";
+  }
   IR::Code ir;
   std::vector<std::string> arg_places;
 
@@ -1302,7 +1318,6 @@ IR::Code IRTranslator::translateCond(AST::NodePtr node,
 
 IR::Code IRTranslator::translateIfStmt(AST::IfStmtPtr node) {
   IRDebugScope dbg("translateIfStmt", node->to_string());
-  std::cerr << "[IF COND AST] " << node->cond->to_string() << "\n";
   IR::Code ir;
   if (ir_debug_enabled()) {
     std::cerr << "\n[IF STMT] " << node->to_string() << "\n";
@@ -1367,7 +1382,6 @@ IR::Code IRTranslator::translateWhileStmt(AST::WhileStmtPtr node) {
     std::cerr << "\n[WHILE STMT] " << node->to_string() << "\n";
     std::cerr << "[WHILE COND AST] " << node->cond->to_string() << "\n";
   }
-  std::cerr << "[WHILE COND AST] " << node->cond->to_string() << "\n";
   IR::Code ir;
 
   auto cond_label = new_label();
