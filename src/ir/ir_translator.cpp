@@ -551,6 +551,36 @@ IR::Code IRTranslator::translateLVal(AST::LValPtr node,
 IR::Code IRTranslator::translateBinaryExp(AST::BinaryExpPtr node,
                                           const std::string& place) {
   IR::Code ir;
+
+  // Keep C/SysY short-circuit semantics for logical operators even when used
+  // as expressions (not only in conditions).
+  if (node->op == BinaryOp::LAnd || node->op == BinaryOp::LOr) {
+    if (place.empty()) {
+      auto sink = new_temp();
+      auto logical_ir = translateBinaryExp(node, sink);
+      append_code(ir, logical_ir);
+      return ir;
+    }
+
+    auto true_label = new_label();
+    auto false_label = new_label();
+    auto end_label = new_label();
+
+    auto cond_ir = translateCond(node, true_label, false_label);
+    append_code(ir, cond_ir);
+
+    ir.push_back(IR::Label::create(true_label));
+    ir.push_back(IR::LoadImm::create(place, 1));
+    ir.push_back(IR::Goto::create(end_label));
+
+    ir.push_back(IR::Label::create(false_label));
+    ir.push_back(IR::LoadImm::create(place, 0));
+    ir.push_back(IR::Goto::create(end_label));
+
+    ir.push_back(IR::Label::create(end_label));
+    return ir;
+  }
+
   auto left_place = new_temp();
   auto right_place = new_temp();
 
