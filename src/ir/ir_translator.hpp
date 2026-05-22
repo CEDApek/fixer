@@ -7,6 +7,7 @@
 #include "ast/tree.hpp"
 #include "ir/ir.hpp"
 #include <unordered_set>
+#include <unordered_map>
 
 class IRTranslator {
  public:
@@ -41,9 +42,29 @@ class IRTranslator {
   IR::Code translateCond(AST::NodePtr node,
                          const std::string& true_label,
                          const std::string& false_label);
+  IR::Code translateValueName(AST::NodePtr node, std::string& out);
 
   std::string new_label();
   std::string new_temp();
+  std::unordered_map<int, std::string> const_cache;
+  std::string getConstTemp(int value);
+  std::unordered_map<std::string, std::string> global_addr_cache;
+  std::string getGlobalAddrTemp(const std::string& name);
+  std::unordered_map<std::string, AST::FuncDefPtr> func_defs;
+  std::vector<std::unordered_map<std::string, std::string>> alias_stack;
+
+  std::string resolveAlias(const std::string& name) const;
+  IR::Code tryInlineFuncCall(AST::FuncCallPtr node,
+                            const std::string& place,
+                            const std::vector<std::string>& arg_places,
+                            bool& inlined);
+  std::vector<std::pair<std::string, std::string>> inline_return_stack;
+  std::vector<std::string> inline_func_stack;
+
+  bool isInlining() const;
+  bool isInlineRecursive(const std::string& name) const;
+  IR::Code translateBoolValue(AST::NodePtr node, const std::string& place);
+                            
 };
 
 #endif  // IR_IR_TRANSLATOR_HPP
