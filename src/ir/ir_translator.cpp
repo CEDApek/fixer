@@ -1,10 +1,96 @@
 #include "ir_translator.hpp"
 
 #include <cassert>
+#include <unordered_set>
+#include <cstdlib>
+#include <iostream>
+
+static bool ir_debug_enabled() {
+  return std::getenv("IR_DEBUG") != nullptr;
+}
+
+static int ir_debug_depth = 0;
+
+static void ir_debug_indent() {
+  for (int i = 0; i < ir_debug_depth; i++) {
+    std::cerr << "  ";
+  }
+}
+
+struct IRDebugScope {
+  std::string name;
+
+  IRDebugScope(const std::string& name, const std::string& info = "")
+      : name(name) {
+    if (!ir_debug_enabled()) return;
+
+    ir_debug_indent();
+    std::cerr << ">> " << name;
+    if (!info.empty()) std::cerr << " : " << info;
+    std::cerr << "\n";
+
+    ir_debug_depth++;
+  }
+
+  ~IRDebugScope() {
+    if (!ir_debug_enabled()) return;
+
+    ir_debug_depth--;
+    ir_debug_indent();
+    std::cerr << "<< " << name << "\n";
+  }
+};
+
+static void dump_ir_code(const std::string& name, const IR::Code& code) {
+  if (!ir_debug_enabled()) return;
+
+  ir_debug_indent();
+  std::cerr << "[IR] " << name << " generated " << code.size() << " instrs\n";
+
+  int count = 0;
+  for (auto& inst : code) {
+    ir_debug_indent();
+    std::cerr << "  " << inst->to_string() << "\n";
+
+    count++;
+    if (count >= 30) {
+      ir_debug_indent();
+      std::cerr << "  ... snipped ...\n";
+      break;
+    }
+  }
+}
 
 static void append_code(IR::Code& dst, IR::Code& src) {
   std::move(src.begin(), src.end(), std::back_inserter(dst));
 }
+
+static bool stmt_must_exit(AST::NodePtr node) {
+  if (!node) return false;
+
+  if (std::dynamic_pointer_cast<AST::ReturnStmt>(node)) {
+    return true;
+  }
+
+  if (auto block = std::dynamic_pointer_cast<AST::Block>(node)) {
+    for (auto& stmt : block->stmts) {
+      if (stmt_must_exit(stmt)) return true;
+    }
+    return false;
+  }
+
+  if (auto ifs = std::dynamic_pointer_cast<AST::IfStmt>(node)) {
+    if (!ifs->else_stmt) return false;
+    return stmt_must_exit(ifs->then_stmt) &&
+           stmt_must_exit(ifs->else_stmt);
+  }
+
+  return false;
+}
+
+static bool is_array_symbol(const SymbolPtr& symbol);
+static std::string ir_name(const SymbolPtr& symbol,
+                           const std::string& fallback);
 
 static std::vector<int> get_array_dims_from_symbol(const SymbolPtr& symbol) {
   if (!symbol || !symbol->type) {
@@ -17,6 +103,12 @@ static std::vector<int> get_array_dims_from_symbol(const SymbolPtr& symbol) {
   }
 
   return arr->dims;
+}
+
+static bool is_relop(BinaryOp op) {
+  return op == BinaryOp::Eq || op == BinaryOp::Ne ||
+         op == BinaryOp::Lt || op == BinaryOp::Le ||
+         op == BinaryOp::Gt || op == BinaryOp::Ge;
 }
 
 static int total_elems(const std::vector<int>& dims) {
@@ -35,6 +127,13 @@ static int product_from(const std::vector<int>& dims, int start) {
   return result;
 }
 
+static bool ends_with_return_or_goto(const IR::Code& code) {
+  if (code.empty()) return false;
+  auto last = code.back();
+  return std::dynamic_pointer_cast<IR::Return>(last) ||
+         std::dynamic_pointer_cast<IR::Goto>(last);
+}
+
 static int brace_depth(AST::InitValPtr init) {
   if (!init || !init->is_list) return 0;
 
@@ -43,6 +142,80 @@ static int brace_depth(AST::InitValPtr init) {
     best = std::max(best, brace_depth(elem));
   }
   return best + 1;
+}
+
+static bool stmt_always_returns(AST::NodePtr node) {
+  if (!node) return false;
+
+  if (std::dynamic_pointer_cast<AST::ReturnStmt>(node)) {
+    return true;
+  }
+
+  if (auto block = std::dynamic_pointer_cast<AST::Block>(node)) {
+    for (auto& stmt : block->stmts) {
+      if (stmt_always_returns(stmt)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  if (auto ifs = std::dynamic_pointer_cast<AST::IfStmt>(node)) {
+    if (!ifs->else_stmt) return false;
+    return stmt_always_returns(ifs->then_stmt) &&
+           stmt_always_returns(ifs->else_stmt);
+  }
+
+  return false;
+}
+
+static bool eval_const_int(AST::NodePtr node, int& out) {
+  if (!node) return false;
+
+  if (auto c = std::dynamic_pointer_cast<AST::IntConst>(node)) {
+    out = c->value;
+    return true;
+  }
+
+  if (auto u = std::dynamic_pointer_cast<AST::UnaryExp>(node)) {
+    int v;
+    if (!eval_const_int(u->exp, v)) return false;
+
+    if (u->op == UnaryOp::Pos) out = v;
+    else if (u->op == UnaryOp::Neg) out = -v;
+    else if (u->op == UnaryOp::Not) out = !v;
+    else return false;
+
+    return true;
+  }
+
+  if (auto b = std::dynamic_pointer_cast<AST::BinaryExp>(node)) {
+    int l, r;
+    if (!eval_const_int(b->left, l)) return false;
+    if (!eval_const_int(b->right, r)) return false;
+
+    switch (b->op) {
+      case BinaryOp::Add: out = l + r; return true;
+      case BinaryOp::Sub: out = l - r; return true;
+      case BinaryOp::Mul: out = l * r; return true;
+      case BinaryOp::Div: if (r == 0) return false; out = l / r; return true;
+      case BinaryOp::Mod: if (r == 0) return false; out = l % r; return true;
+
+      case BinaryOp::Eq: out = l == r; return true;
+      case BinaryOp::Ne: out = l != r; return true;
+      case BinaryOp::Lt: out = l < r; return true;
+      case BinaryOp::Le: out = l <= r; return true;
+      case BinaryOp::Gt: out = l > r; return true;
+      case BinaryOp::Ge: out = l >= r; return true;
+
+      case BinaryOp::LAnd: out = l && r; return true;
+      case BinaryOp::LOr: out = l || r; return true;
+
+      default: return false;
+    }
+  }
+
+  return false;
 }
 
 static void fill_init_range(AST::InitValPtr init,
@@ -112,6 +285,94 @@ static void fill_init_range(AST::InitValPtr init,
   }
 }
 
+// static AST::ReturnStmtPtr as_return_stmt(AST::NodePtr node) {
+//   if (!node) return nullptr;
+
+//   if (auto ret = std::dynamic_pointer_cast<AST::ReturnStmt>(node)) {
+//     return ret;
+//   }
+
+//   if (auto block = std::dynamic_pointer_cast<AST::Block>(node)) {
+//     if (block->stmts.size() == 1) {
+//       return std::dynamic_pointer_cast<AST::ReturnStmt>(block->stmts[0]);
+//     }
+//   }
+
+//   return nullptr;
+// }
+
+static bool contains_direct_call(AST::NodePtr node, const std::string& name) {
+  if (!node) return false;
+
+  if (auto call = std::dynamic_pointer_cast<AST::FuncCall>(node)) {
+    return call->name == name;
+  }
+
+  for (auto& child : node->get_children()) {
+    if (contains_direct_call(child, name)) return true;
+  }
+
+  return false;
+}
+
+static bool contains_while(AST::NodePtr node) {
+  if (!node) return false;
+
+  if (std::dynamic_pointer_cast<AST::WhileStmt>(node)) return true;
+
+  for (auto& child : node->get_children()) {
+    if (contains_while(child)) return true;
+  }
+
+  return false;
+}
+
+static bool contains_local_array(AST::NodePtr node) {
+  if (!node) return false;
+
+  if (auto def = std::dynamic_pointer_cast<AST::VarDef>(node)) {
+    if (!def->dims.empty()) return true;
+  }
+
+  for (auto& child : node->get_children()) {
+    if (contains_local_array(child)) return true;
+  }
+
+  return false;
+}
+
+static bool assigns_scalar_param(AST::NodePtr node,
+                                 const std::unordered_set<std::string>& params) {
+  if (!node) return false;
+
+  if (auto asg = std::dynamic_pointer_cast<AST::AssignStmt>(node)) {
+    if (asg->lval && asg->lval->indices.empty()) {
+      std::string lhs = ir_name(asg->lval->symbol, asg->lval->ident);
+      if (params.count(lhs)) return true;
+    }
+  }
+
+  for (auto& child : node->get_children()) {
+    if (assigns_scalar_param(child, params)) return true;
+  }
+
+  return false;
+}
+
+static bool contains_func_call(AST::NodePtr node) {
+  if (!node) return false;
+
+  if (std::dynamic_pointer_cast<AST::FuncCall>(node)) {
+    return true;
+  }
+
+  for (auto& child : node->get_children()) {
+    if (contains_func_call(child)) return true;
+  }
+
+  return false;
+}
+
 static std::vector<AST::NodePtr> flatten_array_init(AST::InitValPtr init,
                                                     const std::vector<int>& dims) {
   int total = product_from(dims, 0);
@@ -137,18 +398,154 @@ std::string IRTranslator::new_label() {
   return "L" + std::to_string(label_count++);
 }
 
+std::string IRTranslator::getConstTemp(int value) {
+  auto it = const_cache.find(value);
+  if (it != const_cache.end()) {
+    return it->second;
+  }
+
+  std::string temp = new_temp();
+  const_cache[value] = temp;
+  return temp;
+}
+
+bool IRTranslator::isInlining() const {
+  return !inline_return_stack.empty();
+}
+
+bool IRTranslator::isInlineRecursive(const std::string& name) const {
+  for (auto& f : inline_func_stack) {
+    if (f == name) return true;
+  }
+  return false;
+}
+
+std::string IRTranslator::resolveAlias(const std::string& name) const {
+  for (auto it = alias_stack.rbegin(); it != alias_stack.rend(); ++it) {
+    auto found = it->find(name);
+    if (found != it->end()) {
+      return found->second;
+    }
+  }
+  return name;
+}
+
+IR::Code IRTranslator::translateValueName(AST::NodePtr node,
+                                          std::string& out) {
+  IRDebugScope dbg("translateValueName", node ? node->to_string() : "null");
+  IR::Code ir;
+
+  if (auto c = std::dynamic_pointer_cast<AST::IntConst>(node)) {
+    std::cerr << "[VALUE KIND] int const " << c->value << "\n";
+    out = new_temp();
+    ir.push_back(IR::LoadImm::create(out, c->value));
+    dump_ir_code("translateValueName", ir);return ir;
+  }
+
+  if (auto lv = std::dynamic_pointer_cast<AST::LVal>(node)) {
+    std::cerr << "[VALUE KIND] lval " << lv->ident
+              << ", indices=" << lv->indices.size() << "\n";
+    std::string name = resolveAlias(ir_name(lv->symbol, lv->ident));
+    bool is_global = global_symbols.count(name) > 0;
+    bool is_array = is_array_symbol(lv->symbol);
+
+    if (lv->indices.empty()) {
+      if (!is_global) {
+        out = name;
+        dump_ir_code("translateValueName", ir);return ir;
+      }
+
+      if (is_array) {
+        out = new_temp();
+        ir.push_back(IR::LoadAddr::create(out, name));
+        dump_ir_code("translateValueName", ir);return ir;
+      }
+
+      auto addr = new_temp();
+      out = new_temp();
+      ir.push_back(IR::LoadAddr::create(addr, name));
+      ir.push_back(IR::Deref::create(out, addr));
+      dump_ir_code("translateValueName", ir);return ir;
+    }
+  }
+
+  // IMPORTANT: judgment/logical expression used as value
+  if (auto bin = std::dynamic_pointer_cast<AST::BinaryExp>(node)) {
+      std::cerr << "[VALUE KIND] binary expression op="
+            << op_to_string(bin->op) << "\n";
+    if (bin->op == BinaryOp::LAnd || bin->op == BinaryOp::LOr ||
+        is_relop(bin->op)) {
+      out = new_temp();
+      auto bool_ir = translateBoolValue(node, out);
+      append_code(ir, bool_ir);
+      dump_ir_code("translateValueName", ir);return ir;
+    }
+  }
+
+  out = new_temp();
+  auto exp_ir = translateExp(node, out);
+  append_code(ir, exp_ir);
+  dump_ir_code("translateValueName", ir);return ir;
+}
+
+std::string IRTranslator::getGlobalAddrTemp(const std::string& name) {
+  auto it = global_addr_cache.find(name);
+  if (it != global_addr_cache.end()) {
+    return it->second;
+  }
+
+  std::string temp = new_temp();
+  global_addr_cache[name] = temp;
+  return temp;
+}
+
 static bool is_array_symbol(const SymbolPtr& symbol) {
   if (!symbol || !symbol->type) return false;
   return std::dynamic_pointer_cast<ArrayType>(symbol->type) != nullptr;
 }
 
 static int const_expr_value(AST::NodePtr node) {
+  if (!node) return 0;
+
   if (auto c = std::dynamic_pointer_cast<AST::IntConst>(node)) {
     return c->value;
   }
 
-  // Global initializers in this lab are usually constants.
-  // If you need more later, add constant folding here.
+  if (auto u = std::dynamic_pointer_cast<AST::UnaryExp>(node)) {
+    int v = const_expr_value(u->exp);
+
+    if (u->op == UnaryOp::Pos) return v;
+    if (u->op == UnaryOp::Neg) return -v;
+    if (u->op == UnaryOp::Not) return !v;
+
+    return 0;
+  }
+
+  if (auto b = std::dynamic_pointer_cast<AST::BinaryExp>(node)) {
+    int l = const_expr_value(b->left);
+    int r = const_expr_value(b->right);
+
+    switch (b->op) {
+      case BinaryOp::Add: return l + r;
+      case BinaryOp::Sub: return l - r;
+      case BinaryOp::Mul: return l * r;
+      case BinaryOp::Div: return r == 0 ? 0 : l / r;
+      case BinaryOp::Mod: return r == 0 ? 0 : l % r;
+
+      case BinaryOp::Eq: return l == r;
+      case BinaryOp::Ne: return l != r;
+      case BinaryOp::Lt: return l < r;
+      case BinaryOp::Le: return l <= r;
+      case BinaryOp::Gt: return l > r;
+      case BinaryOp::Ge: return l >= r;
+
+      case BinaryOp::LAnd: return l && r;
+      case BinaryOp::LOr: return l || r;
+
+      default: return 0;
+    }
+  }
+
   return 0;
 }
 
@@ -220,23 +617,27 @@ IR::Code IRTranslator::translateExp(AST::NodePtr node,
 IR::Code IRTranslator::translateCompUnit(AST::CompUnitPtr node) {
   IR::Code ir;
 
-  // First pass: emit global variables before functions.
-  in_global_scope = true;
+  func_defs.clear();
 
+  for (auto& unit : node->units) {
+    if (auto func = std::dynamic_pointer_cast<AST::FuncDef>(unit)) {
+      func_defs[func->name] = func;
+    }
+  }
+
+  // existing global pass
+  in_global_scope = true;
   for (auto& unit : node->units) {
     if (auto decl = std::dynamic_pointer_cast<AST::VarDecl>(unit)) {
       auto global_ir = translateGlobalVarDecl(decl);
       append_code(ir, global_ir);
     }
   }
-
   in_global_scope = false;
 
-  // Second pass: emit functions.
+  // existing function pass
   for (auto& unit : node->units) {
-    if (std::dynamic_pointer_cast<AST::VarDecl>(unit)) {
-      continue;
-    }
+    if (std::dynamic_pointer_cast<AST::VarDecl>(unit)) continue;
 
     auto unit_ir = translate(unit);
     append_code(ir, unit_ir);
@@ -298,22 +699,22 @@ IR::Code IRTranslator::translateGlobalVarDef(AST::VarDefPtr node) {
 
 IR::Code IRTranslator::translateLValAddr(AST::LValPtr node,
                                          const std::string& addr_place) {
+  IRDebugScope dbg("translateLValAddr", node->to_string());
+  std::cerr << "[ADDR] " << node->ident
+            << ", indices=" << node->indices.size() << "\n";
   IR::Code ir;
 
-  std::string base_name = ir_name(node->symbol, node->ident);
+  std::string base_name = resolveAlias(ir_name(node->symbol, node->ident));
   bool is_global = global_symbols.count(base_name) > 0;
 
   std::string base = base_name;
-
-  // Global variable/array: get address first.
   if (is_global) {
     base = new_temp();
     ir.push_back(IR::LoadAddr::create(base, base_name));
   }
 
-  // No index: address of variable/array itself.
   if (node->indices.empty()) {
-    if (!addr_place.empty()) {
+    if (!addr_place.empty() && addr_place != base) {
       ir.push_back(IR::Assign::create(addr_place, base));
     }
     return ir;
@@ -321,42 +722,72 @@ IR::Code IRTranslator::translateLValAddr(AST::LValPtr node,
 
   std::vector<int> dims = get_array_dims_from_symbol(node->symbol);
 
-  std::string offset_elems;
+  int const_offset_bytes = 0;
+  std::string dynamic_offset_bytes;
 
   for (int i = 0; i < (int)node->indices.size(); i++) {
-    auto idx_place = new_temp();
-    auto idx_ir = translateExp(node->indices[i], idx_place);
-    append_code(ir, idx_ir);
-
     int stride = 1;
     for (int j = i + 1; j < (int)dims.size(); j++) {
       stride *= dims[j];
     }
 
-    auto term = new_temp();
-    if (stride == 1) {
-      ir.push_back(IR::Assign::create(term, idx_place));
-    } else {
-      ir.push_back(IR::BinaryImm::create(term, idx_place, BinaryOp::Mul, stride));
+    int scale_bytes = stride * 4;
+
+    if (auto c = std::dynamic_pointer_cast<AST::IntConst>(node->indices[i])) {
+      const_offset_bytes += c->value * scale_bytes;
+      continue;
     }
 
-    if (offset_elems.empty()) {
-      offset_elems = term;
+    std::string idx_name;
+    auto idx_ir = translateValueName(node->indices[i], idx_name);
+    append_code(ir, idx_ir);
+
+    std::string term = idx_name;
+    if (scale_bytes != 1) {
+      term = new_temp();
+      ir.push_back(IR::BinaryImm::create(term, idx_name,
+                                         BinaryOp::Mul, scale_bytes));
+    }
+
+    if (dynamic_offset_bytes.empty()) {
+      dynamic_offset_bytes = term;
     } else {
       auto sum = new_temp();
-      ir.push_back(IR::Binary::create(sum, offset_elems, BinaryOp::Add, term));
-      offset_elems = sum;
+      ir.push_back(IR::Binary::create(sum, dynamic_offset_bytes,
+                                      BinaryOp::Add, term));
+      dynamic_offset_bytes = sum;
     }
   }
 
-  auto byte_offset = new_temp();
-  ir.push_back(IR::BinaryImm::create(byte_offset, offset_elems, BinaryOp::Mul, 4));
-  ir.push_back(IR::Binary::create(addr_place, base, BinaryOp::Add, byte_offset));
+  if (dynamic_offset_bytes.empty()) {
+    if (const_offset_bytes == 0) {
+      if (addr_place != base) {
+        ir.push_back(IR::Assign::create(addr_place, base));
+      }
+    } else {
+      ir.push_back(IR::BinaryImm::create(addr_place, base,
+                                         BinaryOp::Add, const_offset_bytes));
+    }
+    return ir;
+  }
 
+  if (const_offset_bytes != 0) {
+    auto with_const = new_temp();
+    ir.push_back(IR::BinaryImm::create(with_const, dynamic_offset_bytes,
+                                       BinaryOp::Add, const_offset_bytes));
+    dynamic_offset_bytes = with_const;
+  }
+
+  ir.push_back(IR::Binary::create(addr_place, base,
+                                  BinaryOp::Add, dynamic_offset_bytes));
   return ir;
 }
 
 IR::Code IRTranslator::translateFuncDef(AST::FuncDefPtr node) {
+  if (ir_debug_enabled()) {
+    std::cerr << "\n========== FUNCTION "
+              << node->name << " ==========\n";
+  }
   IR::Code ir;
 
   ir.push_back(IR::Function::create(node->name));
@@ -366,26 +797,17 @@ IR::Code IRTranslator::translateFuncDef(AST::FuncDefPtr node) {
     ir.push_back(IR::Param::create(pname));
   }
 
+  // Do not preload constants/global addresses at function entry.
+  // Recursive tree functions often return early; preloading hurts timeout.
+  const_cache.clear();
+  global_addr_cache.clear();
+
   auto block_ir = translate(node->block);
   append_code(ir, block_ir);
 
-  // SysY allows void functions to omit "return;"
-  // But Zero IR interpreter requires every function to return.
-  if (node->return_btype == BasicType::Void) {
-    bool has_tail_return_or_goto = false;
-
-    if (!ir.empty()) {
-      auto last = ir.back();
-
-      if (std::dynamic_pointer_cast<IR::Return>(last) ||
-          std::dynamic_pointer_cast<IR::Goto>(last)) {
-        has_tail_return_or_goto = true;
-      }
-    }
-
-    if (!has_tail_return_or_goto) {
-      ir.push_back(IR::Return::create());
-    }
+  if (node->return_btype == BasicType::Void &&
+      !ends_with_return_or_goto(ir)) {
+    ir.push_back(IR::Return::create());
   }
 
   return ir;
@@ -393,10 +815,16 @@ IR::Code IRTranslator::translateFuncDef(AST::FuncDefPtr node) {
 
 IR::Code IRTranslator::translateBlock(AST::BlockPtr node) {
   IR::Code ir;
+
   for (auto& stmt : node->stmts) {
     auto stmt_ir = translate(stmt);
-    std::move(stmt_ir.begin(), stmt_ir.end(), std::back_inserter(ir));
+    append_code(ir, stmt_ir);
+
+    if (!ir.empty() && std::dynamic_pointer_cast<IR::Return>(ir.back())) {
+      break;
+    }
   }
+
   return ir;
 }
 
@@ -451,77 +879,114 @@ IR::Code IRTranslator::translateVarDef(AST::VarDefPtr node) {
 }
 
 IR::Code IRTranslator::translateAssignStmt(AST::AssignStmtPtr node) {
+  IRDebugScope dbg("translateAssignStmt", node->to_string());
+  std::cerr << "[ASSIGN LHS] " << node->lval->to_string() << "\n";
   IR::Code ir;
 
   std::string lhs_name = ir_name(node->lval->symbol, node->lval->ident);
   bool is_global = global_symbols.count(lhs_name) > 0;
   bool lhs_is_array = is_array_symbol(node->lval->symbol);
 
-  // Local scalar assignment
   if (node->lval->indices.empty() && !is_global && !lhs_is_array) {
-    auto r_ir = translateExp(node->exp, lhs_name);
-    append_code(ir, r_ir);
+    std::string rhs_name;
+    auto rhs_ir = translateValueName(node->exp, rhs_name);
+    append_code(ir, rhs_ir);
+
+    if (rhs_name != lhs_name) {
+      ir.push_back(IR::Assign::create(lhs_name, rhs_name));
+    }
     return ir;
   }
 
-  // Global scalar or array element assignment
-  auto rhs = new_temp();
-  auto rhs_ir = translateExp(node->exp, rhs);
+  std::string rhs_name;
+  auto rhs_ir = translateValueName(node->exp, rhs_name);
   append_code(ir, rhs_ir);
 
   auto addr = new_temp();
   auto addr_ir = translateLValAddr(node->lval, addr);
   append_code(ir, addr_ir);
 
-  ir.push_back(IR::Store::create(addr, rhs));
+  ir.push_back(IR::Store::create(addr, rhs_name));
   return ir;
 }
 
 IR::Code IRTranslator::translateReturnStmt(AST::ReturnStmtPtr node) {
+  IRDebugScope dbg("translateReturnStmt", node->to_string());
   IR::Code ir;
 
-  // 翻译返回值
-  // 如果有返回值，则：
-  // place = new_temp();
-  // auto exp_ir = translateExp(node->exp, place);
-  // return exp_ir + [RETURN place];
-  // 否则：
-  // return [RETURN];
+  if (isInlining()) {
+    auto [ret_place, ret_label] = inline_return_stack.back();
+
+    if (node->exp && !ret_place.empty()) {
+      std::string ret_name;
+      auto ret_ir = translateValueName(node->exp, ret_name);
+      append_code(ir, ret_ir);
+
+      if (ret_name != ret_place) {
+        ir.push_back(IR::Assign::create(ret_place, ret_name));
+      }
+    }
+
+    ir.push_back(IR::Goto::create(ret_label));
+    return ir;
+  }
 
   if (node->exp) {
-    auto place = new_temp();
-    auto exp_ir = translateExp(node->exp, place);
-    append_code(ir, exp_ir);
-    ir.push_back(IR::Return::create(place));
+    std::string ret_name;
+    auto ret_ir = translateValueName(node->exp, ret_name);
+    append_code(ir, ret_ir);
+    ir.push_back(IR::Return::create(ret_name));
   } else {
     ir.push_back(IR::Return::create());
   }
-//#warning Not implemented: IRTranslator::translateReturnStmt
 
   return ir;
 }
 
 IR::Code IRTranslator::translateLVal(AST::LValPtr node,
                                      const std::string& place) {
+  IRDebugScope dbg("translateLVal", node->to_string());
+  std::cerr << "[LVAL] " << node->ident
+            << ", indices=" << node->indices.size() << "\n";
   IR::Code ir;
 
   std::string name = ir_name(node->symbol, node->ident);
   bool is_global = global_symbols.count(name) > 0;
   bool is_array = is_array_symbol(node->symbol);
 
-  // Local scalar
+  // local scalar: directly read variable
   if (node->indices.empty() && !is_global && !is_array) {
+    if (!place.empty()) ir.push_back(IR::Assign::create(place, name));
+    return ir;
+  }
+
+  // local array name: address
+  if (node->indices.empty() && !is_global && is_array) {
+    if (!place.empty()) ir.push_back(IR::Assign::create(place, name));
+    return ir;
+  }
+
+  // global scalar: load from &name
+  if (node->indices.empty() && is_global && !is_array) {
+    auto addr = new_temp();
+    ir.push_back(IR::LoadAddr::create(addr, name));
     if (!place.empty()) {
-      ir.push_back(IR::Assign::create(place, name));
+      ir.push_back(IR::Deref::create(place, addr));
     }
     return ir;
   }
 
-  // Plain local array name: address
-  if (node->indices.empty() && !is_global && is_array) {
+  // global array name: address
+  if (node->indices.empty() && is_global && is_array) {
     if (!place.empty()) {
-      ir.push_back(IR::Assign::create(place, name));
+      ir.push_back(IR::LoadAddr::create(place, name));
     }
+    return ir;
+  }
+
+  // global array name: address
+  if (node->indices.empty() && is_global && is_array) {
+    if (!place.empty()) ir.push_back(IR::LoadAddr::create(place, name));
     return ir;
   }
 
@@ -529,96 +994,93 @@ IR::Code IRTranslator::translateLVal(AST::LValPtr node,
   auto addr_ir = translateLValAddr(node, addr);
   append_code(ir, addr_ir);
 
-  std::vector<int> dims = get_array_dims_from_symbol(node->symbol);
+  auto dims = get_array_dims_from_symbol(node->symbol);
 
-  // Partial array indexing gives address.
-  // Example: int a[4][2]; a[2] is address of row 2.
+  // partial array indexing returns address, e.g. a[2] for int a[4][2]
   if (is_array && (int)node->indices.size() < (int)dims.size()) {
-    if (!place.empty()) {
-      ir.push_back(IR::Assign::create(place, addr));
-    }
+    if (!place.empty()) ir.push_back(IR::Assign::create(place, addr));
     return ir;
   }
 
-  // Global scalar or full array element access: load value.
-  if (!place.empty()) {
-    ir.push_back(IR::Deref::create(place, addr));
-  }
-
+  if (!place.empty()) ir.push_back(IR::Deref::create(place, addr));
   return ir;
 }
 
 IR::Code IRTranslator::translateBinaryExp(AST::BinaryExpPtr node,
                                           const std::string& place) {
+  IRDebugScope dbg("translateBinaryExp", node->to_string());
+  std::cerr << "[BINARY OP] " << op_to_string(node->op) << "\n";
   IR::Code ir;
 
-  // Keep C/SysY short-circuit semantics for logical operators even when used
-  // as expressions (not only in conditions).
-  if (node->op == BinaryOp::LAnd || node->op == BinaryOp::LOr) {
-    if (place.empty()) {
-      auto sink = new_temp();
-      auto logical_ir = translateBinaryExp(node, sink);
-      append_code(ir, logical_ir);
+  // Boolean / relational expression used as value:
+  // x = (a < b), x = (a && b), return a || b
+  if (node->op == BinaryOp::LAnd || node->op == BinaryOp::LOr ||
+      is_relop(node->op)) {
+    return translateBoolValue(node, place);
+  }
+
+  // const op const
+  int const_value;
+  if (eval_const_int(node, const_value)) {
+    if (!place.empty()) {
+      ir.push_back(IR::LoadImm::create(place, const_value));
+    }
+    dump_ir_code("translateBinaryExp", ir);return ir;
+  }
+
+  // x op constant
+  if (node->op == BinaryOp::Add || node->op == BinaryOp::Sub ||
+      node->op == BinaryOp::Mul || node->op == BinaryOp::Div ||
+      node->op == BinaryOp::Mod) {
+    if (auto rc = std::dynamic_pointer_cast<AST::IntConst>(node->right)) {
+      std::string left_name;
+      auto left_ir = translateValueName(node->left, left_name);
+      append_code(ir, left_ir);
+
+      if (!place.empty()) {
+        ir.push_back(IR::BinaryImm::create(place, left_name,
+                                           node->op, rc->value));
+      }
       return ir;
     }
-
-    auto true_label = new_label();
-    auto false_label = new_label();
-    auto end_label = new_label();
-
-    auto cond_ir = translateCond(node, true_label, false_label);
-    append_code(ir, cond_ir);
-
-    ir.push_back(IR::Label::create(true_label));
-    ir.push_back(IR::LoadImm::create(place, 1));
-    ir.push_back(IR::Goto::create(end_label));
-
-    ir.push_back(IR::Label::create(false_label));
-    ir.push_back(IR::LoadImm::create(place, 0));
-    ir.push_back(IR::Goto::create(end_label));
-
-    ir.push_back(IR::Label::create(end_label));
-    return ir;
   }
 
-  auto left_place = new_temp();
-  auto right_place = new_temp();
+  std::string left_name;
+  std::string right_name;
 
-  // 翻译左右子表达式
-  auto left_ir = translateExp(node->left, left_place);
-  auto right_ir = translateExp(node->right, right_place);
+  auto left_ir = translateValueName(node->left, left_name);
+  auto right_ir = translateValueName(node->right, right_name);
 
-  std::move(left_ir.begin(), left_ir.end(), std::back_inserter(ir));
-  std::move(right_ir.begin(), right_ir.end(), std::back_inserter(ir));
+  append_code(ir, left_ir);
+  append_code(ir, right_ir);
 
-  // 添加二元运算指令
   if (!place.empty()) {
-    ir.push_back(IR::Binary::create(place, left_place, node->op, right_place));
+    ir.push_back(IR::Binary::create(place, left_name, node->op, right_name));
   }
+
   return ir;
 }
 
 IR::Code IRTranslator::translateUnaryExp(AST::UnaryExpPtr node,
                                          const std::string& place) {
+  IRDebugScope dbg("translateUnaryExp", node->to_string());
   IR::Code ir;
 
-  auto exp_place = new_temp();
-  auto exp_ir = translateExp(node->exp, exp_place);
+  std::string exp_name;
+  auto exp_ir = translateValueName(node->exp, exp_name);
   append_code(ir, exp_ir);
 
-  if (place.empty()) {
-    return ir;
-  }
+  if (place.empty()) return ir;
 
-  // +x
   if (node->op == UnaryOp::Pos) {
-    ir.push_back(IR::Assign::create(place, exp_place));
+    if (place != exp_name) {
+      ir.push_back(IR::Assign::create(place, exp_name));
+    }
     return ir;
   }
 
-  // -x
   if (node->op == UnaryOp::Neg) {
-    ir.push_back(IR::Unary::create(place, node->op, exp_place));
+    ir.push_back(IR::Unary::create(place, node->op, exp_name));
     return ir;
   }
 
@@ -629,7 +1091,7 @@ IR::Code IRTranslator::translateUnaryExp(AST::UnaryExpPtr node,
     auto end_label = new_label();
 
     ir.push_back(IR::LoadImm::create(zero, 0));
-    ir.push_back(IR::If::create(exp_place, BinaryOp::Eq, zero, true_label));
+    ir.push_back(IR::If::create(exp_name, BinaryOp::Eq, zero, true_label));
     ir.push_back(IR::Goto::create(false_label));
 
     ir.push_back(IR::Label::create(true_label));
@@ -649,17 +1111,24 @@ IR::Code IRTranslator::translateUnaryExp(AST::UnaryExpPtr node,
 
 IR::Code IRTranslator::translateFuncCall(AST::FuncCallPtr node,
                                          const std::string& place) {
+  IRDebugScope dbg("translateFuncCall", node->to_string());
+  std::cerr << "[CALL] " << node->name
+            << ", args=" << node->args.size() << "\n";
   IR::Code ir;
   std::vector<std::string> arg_places;
 
-  // 首先翻译参数表达式，并存在临时变量中
-  // 接下来，添加参数传递指令和函数调用指令
-  // 如果 place 不为空，则将函数调用的返回值赋给 place
   for (auto& arg : node->args) {
-    auto arg_place = new_temp();
-    auto arg_ir = translateExp(arg, arg_place);
+    std::string arg_name;
+    auto arg_ir = translateValueName(arg, arg_name);
     append_code(ir, arg_ir);
-    arg_places.push_back(arg_place);
+    arg_places.push_back(arg_name);
+  }
+
+  bool inlined = false;
+  auto inline_ir = tryInlineFuncCall(node, place, arg_places, inlined);
+  if (inlined) {
+    append_code(ir, inline_ir);
+    return ir;
   }
 
   for (int i = 0; i < (int)arg_places.size(); i++) {
@@ -671,7 +1140,6 @@ IR::Code IRTranslator::translateFuncCall(AST::FuncCallPtr node,
   } else {
     ir.push_back(IR::Call::create(node->name));
   }
-//#warning Not implemented: IRTranslator::translateFuncCall
 
   return ir;
 }
@@ -702,86 +1170,204 @@ IR::Code IRTranslator::translateCond(AST::NodePtr node,
                                      const std::string& false_label) {
   IR::Code ir;
 
-  if (auto bin = std::dynamic_pointer_cast<AST::BinaryExp>(node)) {
-    if (bin->op == BinaryOp::LAnd) {
-      auto mid_label = new_label();
-      auto left_ir = translateCond(bin->left, mid_label, false_label);
-      append_code(ir, left_ir);
-      ir.push_back(IR::Label::create(mid_label));
-      auto right_ir = translateCond(bin->right, true_label, false_label);
-      append_code(ir, right_ir);
-      return ir;
+  if (ir_debug_enabled()) {
+    std::cerr << "\n[TRANSLATE COND] " 
+              << (node ? node->to_string() : "null") << "\n";
+    std::cerr << "  true_label=" << true_label
+              << ", false_label=" << false_label << "\n";
+  }
+
+  int const_value;
+  if (eval_const_int(node, const_value)) {
+    if (ir_debug_enabled()) {
+      std::cerr << "  [COND KIND] constant value = "
+                << const_value << "\n";
     }
 
-    if (bin->op == BinaryOp::LOr) {
-      auto mid_label = new_label();
-      auto left_ir = translateCond(bin->left, true_label, mid_label);
-      append_code(ir, left_ir);
-      ir.push_back(IR::Label::create(mid_label));
-      auto right_ir = translateCond(bin->right, true_label, false_label);
-      append_code(ir, right_ir);
-      return ir;
-    }
+    ir.push_back(IR::Goto::create(const_value != 0 ? true_label : false_label));
+    dump_ir_code("translateCond", ir);
+    return ir;
+  }
 
-    if (bin->op == BinaryOp::Eq || bin->op == BinaryOp::Ne ||
-        bin->op == BinaryOp::Lt || bin->op == BinaryOp::Le ||
-        bin->op == BinaryOp::Gt || bin->op == BinaryOp::Ge) {
-      auto left_place = new_temp();
-      auto right_place = new_temp();
+  if (auto u = std::dynamic_pointer_cast<AST::UnaryExp>(node)) {
+    if (u->op == UnaryOp::Not) {
+      if (ir_debug_enabled()) {
+        std::cerr << "  [COND KIND] unary NOT, swap true/false\n";
+      }
 
-      auto left_ir = translateExp(bin->left, left_place);
-      auto right_ir = translateExp(bin->right, right_place);
-
-      append_code(ir, left_ir);
-      append_code(ir, right_ir);
-
-      ir.push_back(IR::If::create(left_place, bin->op, right_place, true_label));
-      ir.push_back(IR::Goto::create(false_label));
+      auto inner_ir = translateCond(u->exp, false_label, true_label);
+      append_code(ir, inner_ir);
+      dump_ir_code("translateCond", ir);
       return ir;
     }
   }
 
-  auto place = new_temp();
+  if (auto bin = std::dynamic_pointer_cast<AST::BinaryExp>(node)) {
+    if (ir_debug_enabled()) {
+      std::cerr << "  [COND BINARY OP] "
+                << op_to_string(bin->op) << "\n";
+      std::cerr << "  [COND LEFT] "
+                << (bin->left ? bin->left->to_string() : "null") << "\n";
+      std::cerr << "  [COND RIGHT] "
+                << (bin->right ? bin->right->to_string() : "null") << "\n";
+    }
+
+    if (bin->op == BinaryOp::LAnd) {
+      if (ir_debug_enabled()) {
+        std::cerr << "  [COND KIND] logical AND short-circuit\n";
+      }
+
+      auto mid_label = new_label();
+
+      auto left_ir = translateCond(bin->left, mid_label, false_label);
+      append_code(ir, left_ir);
+
+      ir.push_back(IR::Label::create(mid_label));
+
+      auto right_ir = translateCond(bin->right, true_label, false_label);
+      append_code(ir, right_ir);
+
+      dump_ir_code("translateCond", ir);
+      return ir;
+    }
+
+    if (bin->op == BinaryOp::LOr) {
+      if (ir_debug_enabled()) {
+        std::cerr << "  [COND KIND] logical OR short-circuit\n";
+      }
+
+      auto mid_label = new_label();
+
+      auto left_ir = translateCond(bin->left, true_label, mid_label);
+      append_code(ir, left_ir);
+
+      ir.push_back(IR::Label::create(mid_label));
+
+      auto right_ir = translateCond(bin->right, true_label, false_label);
+      append_code(ir, right_ir);
+
+      dump_ir_code("translateCond", ir);
+      return ir;
+    }
+
+    if (is_relop(bin->op)) {
+      if (ir_debug_enabled()) {
+        std::cerr << "  [COND KIND] relational judgment\n";
+      }
+
+      std::string left_name;
+      std::string right_name;
+
+      auto left_ir = translateValueName(bin->left, left_name);
+      auto right_ir = translateValueName(bin->right, right_name);
+
+      append_code(ir, left_ir);
+      append_code(ir, right_ir);
+
+      if (ir_debug_enabled()) {
+        std::cerr << "  [COND VALUE LEFT] " << left_name << "\n";
+        std::cerr << "  [COND VALUE RIGHT] " << right_name << "\n";
+      }
+
+      ir.push_back(IR::If::create(left_name, bin->op, right_name, true_label));
+      ir.push_back(IR::Goto::create(false_label));
+
+      dump_ir_code("translateCond", ir);
+      return ir;
+    }
+  }
+
+  if (ir_debug_enabled()) {
+    std::cerr << "  [COND KIND] value/expression compared with zero\n";
+  }
+
+  std::string value_name;
+  auto value_ir = translateValueName(node, value_name);
+  append_code(ir, value_ir);
+
   auto zero = new_temp();
-
-  auto exp_ir = translateExp(node, place);
-  append_code(ir, exp_ir);
-
   ir.push_back(IR::LoadImm::create(zero, 0));
-  ir.push_back(IR::If::create(place, BinaryOp::Ne, zero, true_label));
+
+  if (ir_debug_enabled()) {
+    std::cerr << "  [COND VALUE] " << value_name << "\n";
+    std::cerr << "  [COND ZERO] " << zero << "\n";
+  }
+
+  ir.push_back(IR::If::create(value_name, BinaryOp::Ne, zero, true_label));
   ir.push_back(IR::Goto::create(false_label));
 
+  dump_ir_code("translateCond", ir);
   return ir;
 }
 
 IR::Code IRTranslator::translateIfStmt(AST::IfStmtPtr node) {
+  IRDebugScope dbg("translateIfStmt", node->to_string());
+  std::cerr << "[IF COND AST] " << node->cond->to_string() << "\n";
   IR::Code ir;
+  if (ir_debug_enabled()) {
+    std::cerr << "\n[IF STMT] " << node->to_string() << "\n";
+    std::cerr << "[IF COND AST] " << node->cond->to_string() << "\n";
+  }
 
   auto true_label = new_label();
-  auto false_label = new_label();
   auto end_label = new_label();
+
+  // No else: jump false directly to end.
+  if (!node->else_stmt) {
+    auto cond_ir = translateCond(node->cond, true_label, end_label);
+    append_code(ir, cond_ir);
+
+    ir.push_back(IR::Label::create(true_label));
+
+    auto then_ir = translate(node->then_stmt);
+    bool then_ends = ends_with_return_or_goto(then_ir);
+    append_code(ir, then_ir);
+
+    if (!then_ends) {
+      ir.push_back(IR::Goto::create(end_label));
+    }
+
+    ir.push_back(IR::Label::create(end_label));
+    dump_ir_code("translateIfStmt", ir);return ir;
+  }
+
+  // Has else.
+  auto false_label = new_label();
 
   auto cond_ir = translateCond(node->cond, true_label, false_label);
   append_code(ir, cond_ir);
 
   ir.push_back(IR::Label::create(true_label));
+
   auto then_ir = translate(node->then_stmt);
+  bool then_ends = ends_with_return_or_goto(then_ir);
   append_code(ir, then_ir);
-  ir.push_back(IR::Goto::create(end_label));
+
+  if (!then_ends) {
+    ir.push_back(IR::Goto::create(end_label));
+  }
 
   ir.push_back(IR::Label::create(false_label));
-  if (node->else_stmt) {
-    auto else_ir = translate(node->else_stmt);
-    append_code(ir, else_ir);
+
+  auto else_ir = translate(node->else_stmt);
+  bool else_ends = ends_with_return_or_goto(else_ir);
+  append_code(ir, else_ir);
+
+  if (!else_ends) {
+    ir.push_back(IR::Goto::create(end_label));
   }
-  ir.push_back(IR::Goto::create(end_label));
 
   ir.push_back(IR::Label::create(end_label));
-
   return ir;
 }
 
 IR::Code IRTranslator::translateWhileStmt(AST::WhileStmtPtr node) {
+  IRDebugScope dbg("translateWhileStmt", node->to_string());
+  if (ir_debug_enabled()) {
+    std::cerr << "\n[WHILE STMT] " << node->to_string() << "\n";
+    std::cerr << "[WHILE COND AST] " << node->cond->to_string() << "\n";
+  }
+  std::cerr << "[WHILE COND AST] " << node->cond->to_string() << "\n";
   IR::Code ir;
 
   auto cond_label = new_label();
@@ -794,11 +1380,51 @@ IR::Code IRTranslator::translateWhileStmt(AST::WhileStmtPtr node) {
   append_code(ir, cond_ir);
 
   ir.push_back(IR::Label::create(body_label));
+
   auto body_ir = translate(node->body);
+  bool body_ends = ends_with_return_or_goto(body_ir);
   append_code(ir, body_ir);
-  ir.push_back(IR::Goto::create(cond_label));
+
+  if (!body_ends) {
+    ir.push_back(IR::Goto::create(cond_label));
+  }
 
   ir.push_back(IR::Label::create(end_label));
+  dump_ir_code("translateWhileStmt", ir);return ir;
+}
 
+IR::Code IRTranslator::tryInlineFuncCall(AST::FuncCallPtr node,
+                                         const std::string& place,
+                                         const std::vector<std::string>& arg_places,
+                                         bool& inlined) {
+  IR::Code ir;
+  inlined = false;
+  return ir;
+}
+
+IR::Code IRTranslator::translateBoolValue(AST::NodePtr node,
+                                          const std::string& place) {
+  IR::Code ir;
+
+  auto true_label = new_label();
+  auto false_label = new_label();
+  auto end_label = new_label();
+
+  auto cond_ir = translateCond(node, true_label, false_label);
+  append_code(ir, cond_ir);
+
+  ir.push_back(IR::Label::create(true_label));
+  if (!place.empty()) {
+    ir.push_back(IR::LoadImm::create(place, 1));
+  }
+  ir.push_back(IR::Goto::create(end_label));
+
+  ir.push_back(IR::Label::create(false_label));
+  if (!place.empty()) {
+    ir.push_back(IR::LoadImm::create(place, 0));
+  }
+  ir.push_back(IR::Goto::create(end_label));
+
+  ir.push_back(IR::Label::create(end_label));
   return ir;
 }
