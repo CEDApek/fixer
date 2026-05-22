@@ -1,0 +1,41 @@
+// Input: 3 4
+// Output: 9
+
+/*
+ * 3_bsc_funct.sy
+ * Purpose:
+ * - function definitions
+ * - int and void function types
+ * - function with no parameters
+ * - function with multiple parameters
+ * - function call with no arguments
+ * - function call with arguments
+ * - empty return in void function
+ * Input: integers (a,b)
+ * Output: x
+ */
+
+void hello() {
+    ;
+    return;
+}
+
+int get_base() {
+    return 2;
+}
+
+int add3(int a, int b, int c) {
+    return a + b + c;
+}
+
+int main() {
+    int a = read();
+    int b = read();
+    int x = 0;
+
+    hello();
+    x = add3(a, b, get_base());
+
+    write(x);
+    return 0;
+}

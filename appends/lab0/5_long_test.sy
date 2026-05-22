@@ -1,0 +1,94 @@
+// Input: 3 2
+// Output: 18
+
+/*
+ * 5_long_test.sy
+ * Purpose:
+ * - Combines global declarations, functions, arrays, while, if-else,
+ *   empty statement, expression statement, assignment, and returns
+ * - Computes the sum of values in an array generated from input
+ * Source:
+ * - Adapted from a common introductory array-processing exercise
+ * Input: integer n
+ * Output: sum
+ */
+
+int global_a;
+int global_b[3] = {1, 2, 3};
+int global_c[2][2] = {{1, 0}, {0, 1}};
+
+void touch() {
+    ;
+    return;
+}
+
+int value0() {
+    return 0;
+}
+
+int make_value(int x, int y) {
+    int z = 0;
+    z = x * y + x / 2 - y % 2;
+    return z;
+}
+
+int fill(int arr[], int n, int seed) {
+    int i = 0;
+    while (i < n) {
+        arr[i] = make_value(i + 1, seed);
+        i = i + 1;
+    }
+    return n;
+}
+
+int total(int arr[], int n) {
+    int i = 0;
+    int s = 0;
+    while (i < n) {
+        if (arr[i] > 0) {
+            s = s + arr[i];
+        } else {
+            s = s + 0;
+        }
+        i = i + 1;
+    }
+    return s;
+}
+
+int main() {
+    int n = read();
+    int seed = read();
+    int arr[8] = {};
+    int len = 0;
+    int sum = 0;
+    int extra = 0;
+
+    ;
+    n;
+
+    touch();
+
+    if (n < 0) {
+        n = 0;
+    } else {
+        n = n;
+    }
+
+    if (n > 8) {
+        n = 8;
+    }
+
+    len = fill(arr, n, seed);
+    sum = total(arr, len);
+
+    extra = global_b[1] + global_c[0][0] + value0();
+    sum = sum + extra;
+
+    {
+        int local = 1;
+        sum = sum + local;
+    }
+
+    write(sum);
+    return 0;
+}

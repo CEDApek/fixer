@@ -1,0 +1,41 @@
+// Input: 3 1 2
+// Output: 8
+
+/*
+ * 1_bsc_expr.sy
+ * Purpose:
+ * - Test basic arithmetic expressions
+ * - Test unary operators: +, -, !
+ * - Test parentheses
+ * - Test comparisons and logical operators
+ * input: integers (a, b, c)
+ * output: one integer storing the final evaluation
+ * for input: 3 1 2, Expected output : 7
+ */
+
+
+
+int g1;
+int raw_global[4];
+int g2 = 5, g3[2] = {1, 2};
+
+int main() {
+    int a = read();
+    int b = read();
+    int c = read();
+    int x;
+    int y = 0;
+    int arr[3] = {1, 2, 3};
+
+    x = +(a * (b + 2)) - (-c);
+    y = x / 2 + x % 3 - 1;
+
+    if (a < b || a <= b && a > c || a >= c || a == b || a != c) {
+        y = y + arr[1];
+    } else {
+        y = y + 0;
+    }
+
+    write(y);
+    return 0;
+}

@@ -1,0 +1,44 @@
+// Input: 4
+// Output: 16
+
+/*
+ * 2_bsc_statmt.sy
+ * Purpose:
+ * - Cover statements:
+ *   assignment, expression statement, empty statement, block statement :
+ *   	if, if-else, while, return with exp
+ * - Cover unary '!'
+ * Input: integer n
+ * Output: the sum
+ */
+
+int main() {
+    int n = read();
+    int i = 0;
+    int sum = 0;
+    int t = 0;
+
+    ;
+    n;
+
+    {
+        t = !0;
+        sum = sum + t;
+    }
+
+    while (i < n) {
+        if (i == 2) {
+            sum = sum + 10;
+        } else {
+            sum = sum + i;
+        }
+        i = i + 1;
+    }
+
+    if (!0) {
+        sum = sum + 1;
+    }
+
+    write(sum);
+    return 0;
+}
